@@ -26,7 +26,8 @@ module Async_cstruct = struct
         match Socket.getopt socket Socket.Opt.error with
         (* XXX(dinosaure): see [sockopt.c], return 0 if nothing. *)
         | 0 -> return (Rresult.R.ok res)
-        | errno -> return (Rresult.R.error (U.Unix_error (Unix.Error.of_system_int ~errno, name, ""))))
+        | errno -> return (Rresult.R.error (U.Unix_error (Unix.Error.of_system_int ~errno, name, "")))
+        | exception exn -> return (Rresult.R.error exn))
     >>= function
     | Ok res -> return res
     | Error exn -> return (Rresult.R.error exn)
@@ -122,6 +123,7 @@ type tracer = Sexplib.Sexp.t -> unit
 type 'addr t =
   { socket : ([ `Active ], 'addr) Socket.t
   ; tracer : tracer option
+  ; recv_buf : Cstruct.t
   ; mutable state : state
   ; mutable linger : Cstruct.t option }
 and state =
@@ -154,7 +156,7 @@ let rd, wr =
   recording_errors Async_cstruct.reader_from_socket,
   recording_errors Async_cstruct.writer_from_socket
 
-let recv_buf = Cstruct.create 4096
+let direct_wr = wr
 
 let rec rd_react t : [ `Ok of Cstruct.t option | `Eof ] Deferred.t =
   let handle tls raw = match tracing t @@ fun () -> Tls.Engine.handle_tls tls raw with
@@ -175,12 +177,12 @@ let rec rd_react t : [ `Ok of Cstruct.t option | `Eof ] Deferred.t =
     then Socket.shutdown t.socket `Receive
   ; return `Eof
   | `Active _ ->
-    rd t recv_buf >>= fun r -> match t.state, r with
+    rd t t.recv_buf >>= fun r -> match t.state, r with
     | `Active _, `Eof ->
       t.state <- `Eof
     ; return `Eof
     | `Active tls, `Ok n ->
-      handle tls (Cstruct.sub recv_buf 0 n)
+      handle tls (Cstruct.sub t.recv_buf 0 n)
     | `Error exn, _ ->
       (* XXX(dinosaure): see [rd], when [Async_cstruct.reader_from_socket]
          returns [Error], we set [t.state] to be [`Error] (then, we get this
@@ -214,6 +216,8 @@ let rec rd t buf =
     | `Ok None -> rd t buf
     | `Ok (Some res) -> wr_out res
 
+exception Invalid_state
+
 let wrv t css =
   match t.state with
   | `Error exn -> raise exn (* exception leaks *)
@@ -223,7 +227,8 @@ let wrv t css =
     | Some (tls, data) ->
       t.state <- `Active tls
     ; wr t data
-    | None -> assert false (* TODO: [tls] is not ready to send data. *)
+    | None ->
+      raise Invalid_state (* TODO: [tls] is not ready to send data. *)
 
 let wr t cs = wrv t [cs]
 
@@ -286,6 +291,7 @@ let server_of_socket ?tracer config socket =
   drain_handshake
     { state = `Active (Tls.Engine.server config)
     ; socket
+    ; recv_buf = Cstruct.create 4096
     ; linger = None
     ; tracer }
 
@@ -297,9 +303,10 @@ let client_of_socket ?tracer config ?host socket =
   let t =
     { state = `Active tls
     ; socket
+    ; recv_buf = Cstruct.create 4096
     ; linger = None
     ; tracer } in
-  wr t init >>= fun () -> drain_handshake t
+  direct_wr t init >>= fun () -> drain_handshake t
 
 let accept ?tracer config socket =
   Socket.accept socket >>= function

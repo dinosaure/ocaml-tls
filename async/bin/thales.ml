@@ -138,7 +138,6 @@ let to_own_cert own_cert : (Tls.Config.own_cert, [ `Msg of string ]) result Asyn
     Deferred.List.map ~f:(fun (cert, priv_key) -> X509_async.private_of_pems ~cert ~priv_key) chain
     >>| fun chain -> Rresult.R.(list_of_result_to_result_of_list chain >>| fun chain -> `Multiple chain)
 
-
 let on_some f = function Some x -> Async.(f x >>| fun x -> Some x) | None -> Async.return None
 let tracer sexp = Fmt.pr "S> %a.\n%!" Sexplib.Sexp.pp sexp
 
@@ -164,7 +163,7 @@ let handle callback t peer =
         | exn ->
           Fmt.epr "!> %s.\n%!" (Core.Exn.to_string exn))
 
-let run host port config =
+let run_server host port config =
   let open Async in
 
   let callback =
@@ -201,7 +200,33 @@ let run host port config =
   loop socket >>= fun () ->
   return (`Ok ())
 
-let main host port reneg certificates authenticator ciphers hashes =
+let run_client host port config =
+  let open Async in
+
+  Unix.Inet_addr.of_string_or_getbyname host >>= fun host ->
+
+  let socket = Socket.create Socket.Type.tcp in
+  let stdin = Core.Lazy.force Reader.stdin in
+  let stdout = Core.Lazy.force Writer.stdout in
+  let error exn = return () in
+
+  Tls_async.connect config socket (Socket.Address.Inet.create host ~port) >>= fun t ->
+  Tls_async.reader_and_writer ~error t >>= fun (rd, wr, cl) ->
+  let rec client_to_server () =
+    Reader.read_line stdin >>= function
+    | `Ok line -> Writer.write_line wr line; client_to_server ()
+    | `Eof -> Tls_async.close ~error t >>= fun () -> cl in
+  let rec server_to_client () =
+    Reader.read_line rd >>= function
+    | `Ok line ->
+      Writer.write_char stdout '+'
+    ; Writer.write_line stdout line
+    ; server_to_client ()
+    | `Eof -> Tls_async.close ~error t >>= fun () -> cl in
+  Deferred.both (client_to_server ()) (server_to_client ()) >>= fun ((), ()) -> return (`Ok ())
+
+(* XXX(dinosaure): factorize? GADT? *)
+let main_server host port reneg certificates authenticator ciphers hashes =
   let open Async in
 
   X509_async.authenticator authenticator
@@ -211,12 +236,27 @@ let main host port reneg certificates authenticator ciphers hashes =
   | _, (Some (Error (`Msg err))) -> return (`Error (false, err))
   | Ok authenticator, Some (Ok certificates) ->
     let config = Tls.Config.server ?ciphers ?hashes ~reneg ~certificates ~authenticator () in
-    run host port config
+    run_server host port config
   | Ok authenticator, None ->
     let config = Tls.Config.server ?ciphers ?hashes ~reneg ~authenticator () in
-    run host port config
+    run_server host port config
 
-let check host port reneg certificates ca_file ca_path ciphers hashes =
+let main_client host port reneg certificates authenticator ciphers hashes =
+  let open Async in
+
+  X509_async.authenticator authenticator
+  >>= fun authenticator -> on_some to_own_cert certificates
+  >>= fun certificates -> match authenticator, certificates with
+  | (Error (`Msg err)), _
+  | _, (Some (Error (`Msg err))) -> return (`Error (false, err))
+  | Ok authenticator, Some (Ok certificates) ->
+    let config = Tls.Config.client ?ciphers ?hashes ~reneg ~certificates ~authenticator () in
+    run_client host port config
+  | Ok authenticator, None ->
+    let config = Tls.Config.client ?ciphers ?hashes ~reneg ~authenticator () in
+    run_client host port config
+
+let check main host port reneg certificates ca_file ca_path ciphers hashes =
   let authenticator = match ca_file, ca_path with
     | Some ca_file, None -> `Ca_file ca_file
     | None, Some ca_path -> `Ca_dir ca_path
@@ -364,10 +404,29 @@ let port =
   let doc = "Port." in
   Arg.(value & opt int 43 & info ["p"; "port"] ~doc)
 
-let cmd =
+let server_cmd =
+  let doc = "Example to use ocaml-tls as a server with async." in
+  let exits = Term.default_exits in
+  Term.(ret (const (check main_server) $ host $ port $ reneg $ own_cert $ ca_file $ ca_path $ ciphers $ hashes)),
+  Term.info "server" ~doc ~exits
+
+let client_cmd =
+  let doc = "Example to use ocaml-tls as a client with async." in
+  let exits = Term.default_exits in
+  Term.(ret (const (check main_client) $ host $ port $ reneg $ own_cert $ ca_file $ ca_path $ ciphers $ hashes)),
+  Term.info "client" ~doc ~exits
+
+let cmds = [ server_cmd; client_cmd; ]
+
+let main = `Help (`Pager, None)
+
+let cmd_none =
   let doc = "Example to use ocaml-tls with async." in
   let exits = Term.default_exits in
-  Term.(ret (const check $ host $ port $ reneg $ own_cert $ ca_file $ ca_path $ ciphers $ hashes)),
-  Term.info "thales" ~doc ~exits
+  let man =
+    [ `S Manpage.s_description
+    ; `P "Example to use ocaml-tls with async." ] in
+  Term.(ret (const main)),
+  Term.info "thales" ~version:"0.1" ~doc ~exits ~man
 
-let () = Term.(exit @@ eval cmd)
+let () = Term.(exit @@ eval_choice cmd_none cmds)
