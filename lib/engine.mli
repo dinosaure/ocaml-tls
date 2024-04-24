@@ -163,9 +163,10 @@ val handle_tls           : state -> string -> ret
     is a handshake in progress or scheduled. *)
 val handshake_in_progress : state -> bool
 
-(** [send_application_data tls outs] is [(tls' * out) option] where
+(** [send_application_data tls outs] is [Some (tls', out)] where
     [tls'] is the new tls state, and [out] the cstruct to send over the
-    wire (encrypted [outs]). *)
+    wire (encrypted [outs]) when the TLS session is ready. When the TLS
+    session is not ready it is [None]. *)
 val send_application_data : state -> string list -> (state * string) option
 
 (** [send_close_notify tls] is [tls' * out] where [tls'] is the new
